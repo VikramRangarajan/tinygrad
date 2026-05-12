@@ -34,7 +34,7 @@ def _update_torch_metadata(tensor: torch.Tensor, tiny: Tensor) -> None:
   tiny._storage_offset = calculate_storage_offset(tiny)
   mod.update_metadata(tensor, tiny.shape, tiny._strides, tiny._storage_offset)
 def unwrap(x:torch.Tensor) -> Tensor:
-  assert isinstance(x, torch.Tensor), f"x isn't {type(x)}"
+  assert isinstance(x, torch.Tensor) and x.device.type == "tiny", f"x isn't {type(x)} with device=tiny"
   return mod.unwrap(x)
 class TinyBackend:
   def is_initialized(self): return True
