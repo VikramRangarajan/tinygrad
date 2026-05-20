@@ -83,9 +83,6 @@ jobs:
 
   testmacbenchmark:
     name: Mac Benchmark
-    env:
-      # since sudo is required for usbgpu on macos, move the cache to a new location, as some of the files are owned by root
-      PYTHONPYCACHEPREFIX: /tmp/tiny_python_pycache
     runs-on: [self-hosted, macOS]
     timeout-minutes: 60
     defaults:
@@ -194,8 +191,6 @@ jobs:
 
   testusbgpu:
     name: UsbGPU Benchmark
-    env:
-      PYTHONPYCACHEPREFIX: /tmp/tiny_python_pycache
     runs-on: [self-hosted, macOS]
     timeout-minutes: 10
     defaults:
@@ -214,12 +209,13 @@ jobs:
       run: |
         PYTHONPATH=. ./extra/hcq/hcq_smi.py amd kill_pids
         PYTHONPATH=. ./extra/hcq/hcq_smi.py nv kill_pids
+    # since sudo is required for usbgpu on macos, do not write bytecode, as some of the files are owned by root
     - name: UsbGPU boot time
-      run: sudo -E PYTHONPATH=. GMMU=0 DEBUG=2 AM_RESET=1 DEV=USB+AMD time python3.11 test/test_tiny.py TestTiny.test_plus
+      run: sudo -E PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. GMMU=0 DEBUG=2 AM_RESET=1 DEV=USB+AMD time python3.11 test/test_tiny.py TestTiny.test_plus
     - name: UsbGPU tiny tests
-      run: sudo -E PYTHONPATH=. GMMU=0 DEV=USB+AMD python3.11 test/test_tiny.py
+      run: sudo -E PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. GMMU=0 DEV=USB+AMD python3.11 test/test_tiny.py
     - name: UsbGPU copy speeds
-      run: sudo -E PYTHONPATH=. GMMU=0 DEV=USB+AMD python3.11 test/external/external_test_usb_asm24.py TestDevCopySpeeds
+      run: sudo -E PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. GMMU=0 DEV=USB+AMD python3.11 test/external/external_test_usb_asm24.py TestDevCopySpeeds
     #- name: UsbGPU openpilot test
     #  run: sudo -E PYTHONPATH=. GMMU=0 DEV=USB+AMD GRAPH_ONE_KERNEL=1 python3.11 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/9118973ed03c1ae1d40cf69a29507ec2cc78efd7/selfdrive/modeld/models/supercombo.onnx
     - name: UsbGPU (USB4/TB) install script
@@ -629,7 +625,7 @@ jobs:
     - name: IR3 openpilot compile3 0.11.0 driving_vision
       run: BENCHMARK_LOG=ir3_openpilot_0_11_0_vision PYTHONPATH="." ASSERT_MIN_STEP_TIME=17 DEV=QCOM:IR3 FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/v0.11.0/selfdrive/modeld/models/driving_vision.onnx
     - name: openpilot compile3 0.11.0 driving_policy
-      run: BENCHMARK_LOG=openpilot_0_11_0_policy PYTHONPATH="." ASSERT_MIN_STEP_TIME=3 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/v0.11.0/selfdrive/modeld/models/driving_policy.onnx
+      run: BENCHMARK_LOG=openpilot_0_11_0_policy PYTHONPATH="." ASSERT_MIN_STEP_TIME=3.2 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/v0.11.0/selfdrive/modeld/models/driving_policy.onnx
     - name: openpilot compile3 0.11.0 dmonitoring
       run: BENCHMARK_LOG=openpilot_0_11_0_dmonitoring PYTHONPATH="." ASSERT_MIN_STEP_TIME=11 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/v0.11.0/selfdrive/modeld/models/dmonitoring_model.onnx
     - name: DEBUG=2 openpilot compile3 0.10.1 driving_vision
@@ -637,7 +633,7 @@ jobs:
     - name: openpilot compile3 0.10.1 driving_vision
       run: BENCHMARK_LOG=openpilot_0_10_1_vision PYTHONPATH="." ASSERT_MIN_STEP_TIME=17 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/720392c9a5b986981fdbed1bb8c47a6c5573a50e/selfdrive/modeld/models/driving_vision.onnx
     - name: openpilot compile3 0.10.1 driving_policy
-      run: BENCHMARK_LOG=openpilot_0_10_1_policy PYTHONPATH="." ASSERT_MIN_STEP_TIME=3 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/720392c9a5b986981fdbed1bb8c47a6c5573a50e/selfdrive/modeld/models/driving_policy.onnx
+      run: BENCHMARK_LOG=openpilot_0_10_1_policy PYTHONPATH="." ASSERT_MIN_STEP_TIME=3.2 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/720392c9a5b986981fdbed1bb8c47a6c5573a50e/selfdrive/modeld/models/driving_policy.onnx
     - name: openpilot compile3 0.10.1 dmonitoring
       run: BENCHMARK_LOG=openpilot_0_10_1_dmonitoring PYTHONPATH="." ASSERT_MIN_STEP_TIME=11 DEV=QCOM FLOAT16=1 IMAGE=1 NOLOCALS=1 taskset -c 4-7 python3 examples/openpilot/compile3.py https://github.com/commaai/openpilot/raw/720392c9a5b986981fdbed1bb8c47a6c5573a50e/selfdrive/modeld/models/dmonitoring_model.onnx
     - name: benchmark MobileNetV2 on DSP

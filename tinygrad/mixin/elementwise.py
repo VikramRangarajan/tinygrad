@@ -25,8 +25,10 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
   def usum(self, *uops) -> Self: return functools.reduce(operator.or_ if self.dtype is dtypes.bool else operator.add, argfix(*uops), self)
   def uprod(self, *uops) -> Self: return functools.reduce(operator.and_ if self.dtype is dtypes.bool else operator.mul, argfix(*uops), self)
 
-  # NOTE: Tensor overrides this to also set requires_grad=False
   def detach(self) -> Self:
+    """
+    Returns a new tensor with the same data as this tensor, but detached from the autograd graph.
+    """
     return self.alu(Ops.DETACH)
 
   def logical_not(self) -> Self:
@@ -133,7 +135,8 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     ```
     """
     self._check_dtype()
-    return self.logical_not() if self.dtype == dtypes.bool else self ^ -1
+    if self.dtype == dtypes.bool: return self.logical_not()
+    return (self ^ self.dtype.max) if dtypes.is_unsigned(self.dtype) else (self ^ -1)
 
   def bitwise_and(self, x: Self | ConstType, reverse: bool = False) -> Self:
     """
@@ -750,7 +753,7 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     """
     return self * (self * 1.702).sigmoid()
 
-  def gelu(self) -> Self:
+  def gelu(self, approximate:str="tanh") -> Self:
     """
     Applies the Gaussian Error Linear Unit (GELU) function element-wise.
 
@@ -760,7 +763,12 @@ class ElementwiseMixin(DTypeMixin, CreationMixin):
     print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).gelu().numpy())
     ```
     """
-    return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self ** 3)).tanh())
+    if approximate == "tanh":
+      return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self ** 3)).tanh())
+    elif approximate == "none":
+      return self * 0.5 * (1.0 + (self / math.sqrt(2)).erf())
+    else:
+      raise RuntimeError(f"{approximate=} is not supported")
 
   def swish(self) -> Self:
     """
