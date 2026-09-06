@@ -1,167 +1,14 @@
-"""
-BayesTensor: an OpMixin subclass that propagates both E[X] and Var[X] through a graph.
-
-Only ONE primitive needs moment rules: `alu` (elementwise). Everything else (matmul,
-dot, sum, reshape, transpose, ...) is inherited for free from OpMixin, because those ops
-are each defined exactly once in terms of alu / _rop / _mop.
-
-The point of this file is that gradients work in BOTH senses:
-
-  * E[gradient]  -- standard tinygrad autodiff on the MEAN graph (loss.expected_value.backward())
-                    gives the expected gradient dE[L]/d(theta). That is the quantity you
-                    would feed an SGD step on the posterior means.
-
-  * Var[gradient] -- the gradient w.r.t. a random parameter is itself a random quantity
-                    (it is a function of the other random values in the net). We take the
-                    gradient UOp graph straight out of compute_gradient, rebuild it as a
-                    BayesTensor by pairing each forward tensor with its own variance, and
-                    propagate moments through it. This is exactly differentiating the
-                    random loss L directly, no extra derivation needed.
-
-Both are verified against closed form AND against Monte Carlo.
-"""
-
-from __future__ import annotations
+from extra.bayesian_tensor.bayes_tensor import BayesTensor, Tensor
 import numpy as np
-from tinygrad import Tensor
-from tinygrad.helpers import argfix
-from tinygrad.mixin.op import OpMixin
-from tinygrad.uop import Ops, GroupOp
-from tinygrad.uop.ops import UOp
 from tinygrad.mixin.gradient import compute_gradient
+from tinygrad import UOp
+from tinygrad.uop import Ops, GroupOp
 
 
-class BayesTensor(OpMixin):
-  __slots__ = "expected_value", "variance"
-
-  def __init__(self, mean: Tensor, var: Tensor):
-    self.expected_value: Tensor = mean
-    self.variance: Tensor = var
-
-  # ---- the ~8-method abstract surface OpMixin needs ----
-  @property
-  def shape(self):
-    return self.expected_value.shape
-
-  @property
-  def dtype(self):
-    return self.expected_value.dtype
-
-  @property
-  def device(self):
-    return self.expected_value.device
-
-  @classmethod
-  def const(cls, dtype, b):
-    return cls(Tensor.const(dtype, b), Tensor.const(dtype, 0))
-
-  @classmethod
-  def _wrap_uop(cls, u):
-    raise NotImplementedError("cast/ufix are overridden so this is never hit")
-
-  @property
-  def _uop(self):
-    return self.expected_value.uop
-
-  # scalar / uop lifting -> deterministic quantity with zero variance
-  def ufix(self, x):
-    if isinstance(x, BayesTensor):
-      return x
-    if isinstance(x, UOp):
-      x = self.expected_value._wrap_uop(x)
-    return BayesTensor(self.expected_value.ufix(x), self.variance.ufix(x) * 0)
-
-  def cast(self, dtype):
-    if self.expected_value.dtype == dtype and self.variance.dtype == dtype:
-      return self
-    return BayesTensor(self.expected_value.cast(dtype), self.variance.cast(dtype))
-
-  # ---- elementwise primitive: the moment propagation rules ----
-  def alu(self, op: Ops, *src: BayesTensor) -> BayesTensor:
-    match op:
-      case Ops.EXP2:
-        return self  # TODO
-      case Ops.LOG2:
-        return self  # TODO
-      case Ops.SIN:
-        return self  # TODO
-      case Ops.SQRT:
-        return self  # TODO
-      case Ops.RECIPROCAL:
-        # first-order Taylor: E[1/x] ~ 1/m, Var[1/x] ~ v/m^4
-        m, v = self.expected_value, self.variance
-        return BayesTensor(m.reciprocal(), v * m.reciprocal() ** 4)
-      case Ops.NEG:
-        return self  # TODO
-      case Ops.TRUNC:
-        return self  # TODO
-      case Ops.ADD:
-        # Var[a+b] = Va + Vb (independence) and linearity of expectation
-        return BayesTensor(self.expected_value + src[0].expected_value, self.variance + src[0].variance)
-      case Ops.MUL:
-        # E[ab] = ma*mb, Var[ab] = ma^2*Vb + mb^2*Va + Va*Vb
-        ma, va, mb, vb = self.expected_value, self.variance, src[0].expected_value, src[0].variance
-        return BayesTensor(ma * mb, ma * ma * vb + mb * mb * va + va * vb)
-      case Ops.MAX:
-        return self  # TODO
-      case Ops.SUB:
-        return BayesTensor(self.expected_value - src[0].expected_value, self.variance + src[0].variance)
-      case Ops.POW:
-        return self  # TODO
-      case Ops.FDIV:
-        return self  # TODO
-      case Ops.DETACH:
-        # routing (no derivation): detach both moments from autograd
-        return BayesTensor(self.expected_value.detach(), self.variance.detach())
-      case Ops.CONTIGUOUS_BACKWARD:
-        # routing: identity in the backward pass
-        return self
-      case (
-        Ops.CDIV
-        | Ops.CMOD
-        | Ops.CMPLT
-        | Ops.CMPNE
-        | Ops.CMPEQ
-        | Ops.XOR
-        | Ops.SHL
-        | Ops.SHR
-        | Ops.OR
-        | Ops.AND
-        | Ops.THREEFRY
-        | Ops.FLOORDIV
-        | Ops.FLOORMOD
-      ):
-        raise NotImplementedError("Moment propagation rules do not exist for", op)
-      case _:
-        raise NotImplementedError(f"alu rule missing for {op}")
-
-  # ---- reduce primitive: Var[sum] = sum(Var) ----
-  def _rop(self, op: Ops, axis: tuple) -> BayesTensor:
-    match op:
-      case Ops.ADD:
-        return BayesTensor(self.expected_value.sum(axis), self.variance.sum(axis))
-      case _:
-        raise NotImplementedError(f"_rop rule missing for {op}")
-
-  # ---- movement primitive: apply to both moments ----
-  def _mop(self, op: Ops, arg) -> BayesTensor:
-    return BayesTensor(self.expected_value._mop(op, arg), self.variance._mop(op, arg))
-
-  # STACK can't go through _mop (its arg is the *uops* of the other tensors,
-  # so the vars would be lost) -- override the high-level method instead
-  def stack(self, *args, dim=0):
-    tensors = argfix(self, *args)
-    return BayesTensor(
-      tensors[0].expected_value.stack(*[t.expected_value for t in tensors[1:]], dim=dim),
-      tensors[0].variance.stack(*[t.variance for t in tensors[1:]], dim=dim),
-    )
-
-  # contiguous is a no-op semantically for the (mean, var) pair
-  def contiguous(self, **kwargs):
-    return BayesTensor(self.expected_value.contiguous(**kwargs), self.variance.contiguous(**kwargs))
-
-  def __repr__(self):
-    return f"BayesTensor(mean={self.expected_value.shape}, var={self.variance.shape})"
+def check(name, got: np.ndarray, want: np.ndarray, tol=1e-4):
+  ok = np.allclose(got, want, atol=tol, rtol=tol)
+  print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+  assert ok, f"{name}:\n got {got}\nwant {want}"
 
 
 # ---------------------------------------------------------------------------
@@ -195,12 +42,6 @@ def moments(u: UOp, bt_map: dict[UOp, BayesTensor]) -> BayesTensor:
   if u.op is Ops.CONTIGUOUS:
     return moments(u.src[0], bt_map).contiguous()
   raise NotImplementedError(f"moments: unhandled {u.op}")
-
-
-def check(name, got: np.ndarray, want: np.ndarray, tol=1e-4):
-  ok = np.allclose(got, want, atol=tol, rtol=tol)
-  print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
-  assert ok, f"{name}:\n got {got}\nwant {want}"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +100,7 @@ check("dE[L]/dmu_c == ma*mb", C.expected_value.grad.numpy(), (ma * mb))
 # and must match Monte Carlo over samples of (b, c).
 # ---------------------------------------------------------------------------
 print("\n== 3. variance of the gradient ==")
-bt_map = {B.expected_value.uop: B, C.expected_value.uop: C, A.expected_value.uop: A}  # forward tensor -> its moments
+bt_map = {B._uop: B, C._uop: C, A._uop: A}  # forward tensor -> its moments
 # grad of the random loss L=a*b*c w.r.t. each parameter, and its closed-form moments
 targets = {
   "a": (A, mb * mc, mb**2 * vc + mc**2 * vb + vb * vc),  # dL/da = b*c
@@ -267,7 +108,7 @@ targets = {
   "c": (C, ma * mb, ma**2 * vb + mb**2 * va + va * vb),  # dL/dc = a*b
 }
 for name, (tgt, wantE, wantV) in targets.items():
-  grad_uop = compute_gradient(L.expected_value.uop, L.expected_value.uop.const_like(1.0), {tgt.expected_value.uop})[tgt.expected_value.uop]
+  grad_uop = compute_gradient(L._uop, L._uop.const_like(1.0), {tgt._uop})[tgt._uop]
   gm = moments(grad_uop, bt_map)  # rebuild grad graph as BayesTensor
   if name == "a":
     gm_a = gm
@@ -389,10 +230,10 @@ L5 = fused_mul(A5, B5)
 # E[grad] checks and compute_gradient gives us the RANDOM gradient graph for Var[grad].
 (L5.expected_value.sum() + L5.variance.sum()).backward()  # loss touches BOTH outputs -> grad_fxn(dE, dV, call)
 L5u = L5.expected_value + L5.variance
-grad_a5 = compute_gradient(L5u.uop, L5u.uop.const_like(1.0), {A5.expected_value.uop})[A5.expected_value.uop]
+grad_a5 = compute_gradient(L5u.uop, L5u.uop.const_like(1.0), {A5._uop})[A5._uop]
 bt_map5 = {
-  A5.expected_value.uop: A5,
-  B5.expected_value.uop: B5,
+  A5._uop: A5,
+  B5._uop: B5,
   A5.variance.uop: BayesTensor(A5.variance, A5.variance.const_like(0)),  # variance tensors are deterministic
   B5.variance.uop: BayesTensor(B5.variance, B5.variance.const_like(0)),
 }
