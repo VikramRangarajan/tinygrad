@@ -1,15 +1,12 @@
-from extra.bayesian_tensor.bayes_tensor import BayesTensor, Tensor
+import unittest
+
 import numpy as np
+from tinygrad import Tensor, UOp
 from tinygrad.mixin.gradient import compute_gradient
-from tinygrad import UOp
 from tinygrad.uop import Ops, GroupOp
+from tinygrad.uop.ops import KernelInfo
 
-
-def check(name, got: np.ndarray, want: np.ndarray, tol=1e-4):
-  ok = np.allclose(got, want, atol=tol, rtol=tol)
-  print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
-  assert ok, f"{name}:\n got {got}\nwant {want}"
-
+from extra.bayesian_tensor.bayes_tensor import BayesTensor
 
 # ---------------------------------------------------------------------------
 # moments(): rebuild an arbitrary UOp expression as a BayesTensor, pairing each
@@ -43,114 +40,117 @@ def moments(u: UOp, bt_map: dict[UOp, BayesTensor]) -> BayesTensor:
     return moments(u.src[0], bt_map).contiguous()
   raise NotImplementedError(f"moments: unhandled {u.op}")
 
-
-# ---------------------------------------------------------------------------
-# Section 1: forward moments. matmul = (a*b).sum() defined ONCE in OpMixin.
-# ---------------------------------------------------------------------------
-print("== 1. forward variance propagation ==")
-Tensor.manual_seed(42)
-a = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3))
-b = BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
-c = a @ b
-assert c.expected_value.shape == (2, 4) and c.variance.shape == (2, 4)
-
-# closed form: Var[A@B] = sum_k (ma_ik^2 Vb_kj + mb_kj^2 Va_ik + Va_ik Vb_kj)
-m = (a.expected_value * a.expected_value) @ b.variance + a.variance @ (b.expected_value * b.expected_value) + a.variance @ b.variance
-check("matmul var == closed form", c.variance.numpy(), m.numpy())
-
-r = c.reciprocal()  # nonlinear op, Taylor rule
-print("  reciprocal E:", r.expected_value.shape, "Var:", r.variance.shape, "(Taylor approx)")
-
-s = a.stack(a2 := BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3)), dim=0)  # stack + routing
-check("stack -> mean+var stacked", s.expected_value.numpy(), np.stack([a.expected_value.numpy(), a2.expected_value.numpy()]))
-assert (s.variance.numpy() >= 0).all()
-d = c.detach()
-check("detach is a no-op", d.expected_value.numpy(), c.expected_value.numpy())
-
-# ---------------------------------------------------------------------------
-# Section 2: E[gradient] -- tinygrad autodiff on the MEAN graph.
-# L = (a*b)*c, so dE[L]/dmu_a = mu_b * mu_c.
-# ---------------------------------------------------------------------------
-print("\n== 2. expected gradient via loss.expected_value.backward() ==")
-N = 4
-rng = np.random.default_rng(0)
-ma, va = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
-mb, vb = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
-mc, vc = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
-
-
 def f32(a):
   return a.astype(np.float32)  # Metal (and most devices) have no double
 
+def _abc_data():
+  # shared fixture for sections 2, 3, 5: L = (a*b)*c moments
+  rng = np.random.default_rng(0)
+  N = 4
+  ma, va = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
+  mb, vb = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
+  mc, vc = rng.uniform(-2, 2, N), rng.uniform(0.2, 1, N)
+  return (ma, va, mb, vb, mc, vc), rng
 
-A = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
-B = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
-C = BayesTensor(Tensor(f32(mc)), Tensor(f32(vc)))
-L = (A * B) * C  # random loss; keep a Tensor graph on the means
-L.expected_value.sum().backward()  # autodiff on the mean graph (scalar loss)
-check("dE[L]/dmu_a == mb*mc", A.expected_value.grad.numpy(), (mb * mc))
-check("dE[L]/dmu_b == ma*mc", B.expected_value.grad.numpy(), (ma * mc))
-check("dE[L]/dmu_c == ma*mb", C.expected_value.grad.numpy(), (ma * mb))
+def _abc_tensors():
+  (ma, va, mb, vb, mc, vc), _ = _abc_data()
+  A = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
+  B = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
+  C = BayesTensor(Tensor(f32(mc)), Tensor(f32(vc)))
+  return A, B, C
 
-# ---------------------------------------------------------------------------
-# Section 3: Var[gradient] -- propagate moments through the gradient graph.
-# grad of the RANDOM loss w.r.t. a is exactly b*c. Its moments must satisfy
-#   E[grad_a]  = mb*mc
-#   Var[grad_a] = mb^2*vc + mc^2*vb + vb*vc
-# and must match Monte Carlo over samples of (b, c).
-# ---------------------------------------------------------------------------
-print("\n== 3. variance of the gradient ==")
-bt_map = {B._uop: B, C._uop: C, A._uop: A}  # forward tensor -> its moments
-# grad of the random loss L=a*b*c w.r.t. each parameter, and its closed-form moments
-targets = {
-  "a": (A, mb * mc, mb**2 * vc + mc**2 * vb + vb * vc),  # dL/da = b*c
-  "b": (B, ma * mc, ma**2 * vc + mc**2 * va + va * vc),  # dL/db = a*c
-  "c": (C, ma * mb, ma**2 * vb + mb**2 * va + va * vb),  # dL/dc = a*b
-}
-for name, (tgt, wantE, wantV) in targets.items():
-  grad_uop = compute_gradient(L._uop, L._uop.const_like(1.0), {tgt._uop})[tgt._uop]
-  gm = moments(grad_uop, bt_map)  # rebuild grad graph as BayesTensor
-  if name == "a":
-    gm_a = gm
-  print(
-    f"  grad_wrt_{tgt.expected_value.numpy().tolist()[:1]}... -> E={gm.expected_value.numpy()[:2].tolist()} Var={gm.variance.numpy()[:2].tolist()}"
-  )
-  check(f"E[grad_{name}] == closed form", gm.expected_value.numpy(), wantE)
-  check(f"Var[grad_{name}] == closed form", gm.variance.numpy(), wantV)
+class TestForwardMoments(unittest.TestCase):
+  def test_matmul_variance_closed_form(self):
+    Tensor.manual_seed(42)
+    a = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3))
+    b = BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
+    c = a @ b
+    self.assertEqual(c.expected_value.shape, (2, 4))
+    self.assertEqual(c.variance.shape, (2, 4))
+    # closed form: Var[A@B] = sum_k (ma_ik^2 Vb_kj + mb_kj^2 Va_ik + Va_ik Vb_kj)
+    want = (a.expected_value * a.expected_value) @ b.variance + \
+           a.variance @ (b.expected_value * b.expected_value) + a.variance @ b.variance
+    np.testing.assert_allclose(c.variance.numpy(), want.numpy(), atol=1e-4, rtol=1e-4)
 
-# Monte Carlo: sample the random values, differentiate the random loss by hand.
-NS = 400_000
-bs = rng.normal(mb, np.sqrt(vb), (NS, N))
-cs = rng.normal(mc, np.sqrt(vc), (NS, N))
-mc_grad_a = (bs * cs).mean(0)  # empirical E[dL/da]
-mc_var_a = (bs * cs).var(0)  # empirical Var[dL/da]
-check("MonteCarlo E[grad_a] == propagated", mc_grad_a, gm_a.expected_value.numpy(), tol=3e-3)
-check("MonteCarlo Var[grad_a] == propagated", mc_var_a, gm_a.variance.numpy(), tol=1e-2)  # variance estimates are noisier
+  def test_reciprocal_shapes(self):
+    Tensor.manual_seed(42)
+    a = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3))
+    b = BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
+    r = (a @ b).reciprocal()  # nonlinear op, Taylor rule
+    self.assertEqual(r.expected_value.shape, (2, 4))
+    self.assertEqual(r.variance.shape, (2, 4))
 
-# ---------------------------------------------------------------------------
-# Section 4: E[gradient] through a real matmul (movement + reduce in the graph).
-# loss = sum(x @ w), so dE[loss]/dw = ones @ x = column sums, broadcast per column.
-# ---------------------------------------------------------------------------
-print("\n== 4. expected gradient through matmul ==")
-Tensor.manual_seed(1)
-x = Tensor.rand(2, 3)
-w = BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
-y = BayesTensor(x, x.const_like(0)) @ w  # deterministic input == zero-variance BayesTensor
-loss = y.sum()
-loss.expected_value.backward()
-expected = (Tensor.ones(2) @ x).unsqueeze(1).expand(3, 4)
-check("dE[loss]/dw == ones@x (broadcast)", w.expected_value.grad.numpy(), expected.numpy())
+  def test_stack(self):
+    Tensor.manual_seed(42)
+    a = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3))
+    a2 = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3))
+    s = a.stack(a2, dim=0)
+    np.testing.assert_allclose(s.expected_value.numpy(), np.stack([a.expected_value.numpy(), a2.expected_value.numpy()]),
+                               atol=1e-6, rtol=1e-6)
+    self.assertTrue((s.variance.numpy() >= 0).all())
 
-# ---------------------------------------------------------------------------
-# Section 5: grad_fxn wrapping a custom fast kernel (flash-attention-style).
-# A fused softmax kernel with the backward RECOMPUTED from the output (the flash
-# attention trick -- no saved intermediates), then a fused (mean, var) moment
-# kernel whose grad_fxn returns gradients for ALL four moments, verified for
-# both E[grad] and Var[grad] through the fused backward graph.
-# ---------------------------------------------------------------------------
-print("\n== 5. grad_fxn wrapping a fused custom kernel ==")
-from tinygrad.uop.ops import KernelInfo
+  def test_detach_noop(self):
+    Tensor.manual_seed(42)
+    c = BayesTensor(Tensor.rand(2, 3), Tensor.rand(2, 3)) @ BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
+    d = c.detach()
+    np.testing.assert_allclose(d.expected_value.numpy(), c.expected_value.numpy(), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(d.variance.numpy(), c.variance.numpy(), atol=1e-6, rtol=1e-6)
 
+class TestExpectedGradient(unittest.TestCase):
+  def test_expected_gradient_product(self):
+    # L = (a*b)*c, so dE[L]/dmu_a = mu_b * mu_c
+    (ma, _, mb, _, mc, _), _ = _abc_data()
+    A, B, C = _abc_tensors()
+    L = (A * B) * C  # random loss; keep a Tensor graph on the means
+    L.expected_value.sum().backward()  # autodiff on the mean graph (scalar loss)
+    np.testing.assert_allclose(A.expected_value.grad.numpy(), mb * mc, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(B.expected_value.grad.numpy(), ma * mc, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(C.expected_value.grad.numpy(), ma * mb, atol=1e-4, rtol=1e-4)
+
+class TestGradientVariance(unittest.TestCase):
+  def _grad_moments(self, name):
+    A, B, C = _abc_tensors()
+    (ma, va, mb, vb, mc, vc), _ = _abc_data()
+    L = (A * B) * C
+    bt_map = {B._uop: B, C._uop: C, A._uop: A}  # forward tensor -> its moments
+    targets = {
+      # grad of the random loss L=a*b*c w.r.t. each parameter, and its closed-form moments
+      "a": (A, mb * mc, mb**2 * vc + mc**2 * vb + vb * vc),  # dL/da = b*c
+      "b": (B, ma * mc, ma**2 * vc + mc**2 * va + va * vc),  # dL/db = a*c
+      "c": (C, ma * mb, ma**2 * vb + mb**2 * va + va * vb),  # dL/dc = a*b
+    }
+    tgt, wantE, wantV = targets[name]
+    grad_uop = compute_gradient(L._uop, L._uop.const_like(1.0), {tgt._uop})[tgt._uop]
+    gm = moments(grad_uop, bt_map)  # rebuild grad graph as BayesTensor
+    return gm, wantE, wantV
+
+  def test_moments_match_closed_form(self):
+    for name in ("a", "b", "c"):
+      with self.subTest(grad=name):
+        gm, wantE, wantV = self._grad_moments(name)
+        np.testing.assert_allclose(gm.expected_value.numpy(), wantE, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(gm.variance.numpy(), wantV, atol=1e-4, rtol=1e-4)
+
+  def test_monte_carlo_grad_a(self):
+    gm, _, _ = self._grad_moments("a")
+    (ma, va, mb, vb, mc, vc), rng = _abc_data()
+    NS = 400_000
+    bs = rng.normal(mb, np.sqrt(vb), (NS, len(mb)))
+    cs = rng.normal(mc, np.sqrt(vc), (NS, len(mc)))
+    np.testing.assert_allclose((bs * cs).mean(0), gm.expected_value.numpy(), atol=3e-3, rtol=3e-3)
+    # variance estimates are noisier
+    np.testing.assert_allclose((bs * cs).var(0), gm.variance.numpy(), atol=1e-2, rtol=1e-2)
+
+class TestMatmulExpectedGradient(unittest.TestCase):
+  def test_expected_gradient_through_matmul(self):
+    # loss = sum(x @ w), so dE[loss]/dw = ones @ x = column sums, broadcast per column
+    Tensor.manual_seed(1)
+    x = Tensor.rand(2, 3)
+    w = BayesTensor(Tensor.rand(3, 4), Tensor.rand(3, 4))
+    y = BayesTensor(x, x.const_like(0)) @ w  # deterministic input == zero-variance BayesTensor
+    y.sum().expected_value.backward()
+    expected = (Tensor.ones(2) @ x).unsqueeze(1).expand(3, 4)
+    np.testing.assert_allclose(w.expected_value.grad.numpy(), expected.numpy(), atol=1e-4, rtol=1e-4)
 
 def fused_softmax_kernel(Y: UOp, X: UOp, M: UOp, S: UOp) -> UOp:
   # one thread per element; row max/sum arrive as (n,1) M, S from tinygrad reduce kernels
@@ -158,7 +158,6 @@ def fused_softmax_kernel(Y: UOp, X: UOp, M: UOp, S: UOp) -> UOp:
   Y, X = Y.flatten(), X.flatten()
   i = UOp.range(Y.numel(), 0)
   return Y[i].store((X[i] - M[i // d, 0]).exp() / S[i // d, 0]).end(i).sink(arg=KernelInfo(name="fused_softmax"))
-
 
 def fused_softmax(x: Tensor) -> Tensor:
   m = x.max(-1, keepdim=True)
@@ -175,20 +174,6 @@ def fused_softmax(x: Tensor) -> Tensor:
   y_out = Tensor.custom_kernel(y, x, m, s, fxn=fused_softmax_kernel, grad_fxn=grad_softmax)[0]
   return y_out
 
-
-n, d = 5, 4
-Tensor.manual_seed(7)
-x = Tensor.randn(n, d)
-y = fused_softmax(x)
-y.square().sum().backward()  # backward BEFORE any realize()/numpy()
-g_fused = x.grad.numpy()
-check("fused softmax == unfused softmax", y.numpy(), x.softmax(-1).numpy())
-x2 = Tensor(x.numpy())
-x2.softmax(-1).square().sum().backward()
-check("fused softmax backward == autodiff", g_fused, x2.grad.numpy())
-
-
-# --- fused (mean, var) moment kernel: grad_fxn returns all four moment gradients ---
 def fused_moments_kernel(E: UOp, V: UOp, A: UOp, VA: UOp, B: UOp, VB: UOp) -> UOp:
   E, V, A, VA, B, VB = (u.flatten() for u in (E, V, A, VA, B, VB))
   i = UOp.range(E.numel(), 0)
@@ -202,7 +187,6 @@ def fused_moments_kernel(E: UOp, V: UOp, A: UOp, VA: UOp, B: UOp, VB: UOp) -> UO
     .sink(arg=KernelInfo(name="fused_moments"))
   )
 
-
 def grad_fused_moments(dE: UOp, dV: UOp, call: UOp):
   _e, _v, a, va, b, vb = call.src[1:]
   A, VA, B, VB = Tensor(a), Tensor(va), Tensor(b), Tensor(vb)
@@ -213,7 +197,6 @@ def grad_fused_moments(dE: UOp, dV: UOp, call: UOp):
   gVB = Tensor(dV) * (A * A + VA)
   return (None, None, gA.uop, gVA.uop, gB.uop, gVB.uop)  # (E, V, A, VA, B, VB)
 
-
 def fused_mul(a: BayesTensor, b: BayesTensor) -> BayesTensor:
   E, V = Tensor.empty_like(a.expected_value), Tensor.empty_like(a.variance)
   E, V, *_ = Tensor.custom_kernel(
@@ -221,39 +204,72 @@ def fused_mul(a: BayesTensor, b: BayesTensor) -> BayesTensor:
   )
   return BayesTensor(E, V)
 
+class TestFusedKernels(unittest.TestCase):
+  def test_fused_softmax_forward_backward(self):
+    n, d = 5, 4
+    Tensor.manual_seed(7)
+    x = Tensor.randn(n, d)
+    y = fused_softmax(x)
+    y.square().sum().backward()  # backward BEFORE any realize()/numpy()
+    g_fused = x.grad.numpy()
+    np.testing.assert_allclose(y.numpy(), x.softmax(-1).numpy(), atol=1e-4, rtol=1e-4)
+    x2 = Tensor(x.numpy())
+    x2.softmax(-1).square().sum().backward()
+    np.testing.assert_allclose(g_fused, x2.grad.numpy(), atol=1e-4, rtol=1e-4)
 
-A5 = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
-B5 = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
-L5 = fused_mul(A5, B5)
+  def test_fused_moments_forward_and_expected_grad(self):
+    (ma, va, mb, vb, _, _), _ = _abc_data()
+    A5 = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
+    B5 = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
+    L5 = fused_mul(A5, B5)
+    # ALL symbolic work happens before any numpy()/realize() below: backward fills the
+    # E[grad] checks and compute_gradient gives us the RANDOM gradient graph for Var[grad].
+    (L5.expected_value.sum() + L5.variance.sum()).backward()  # loss touches BOTH outputs -> grad_fxn(dE, dV, call)
+    np.testing.assert_allclose(A5.expected_value.grad.numpy(), f32(mb + 2 * ma * vb), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(A5.variance.grad.numpy(), f32(mb**2 + vb), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(B5.expected_value.grad.numpy(), f32(ma + 2 * mb * va), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(B5.variance.grad.numpy(), f32(ma**2 + va), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(L5.expected_value.numpy(), f32(ma * mb), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(L5.variance.numpy(), f32(ma**2 * vb + mb**2 * va + va * vb), atol=1e-4, rtol=1e-4)
 
-# ALL symbolic work happens before any numpy()/realize() below: backward fills the
-# E[grad] checks and compute_gradient gives us the RANDOM gradient graph for Var[grad].
-(L5.expected_value.sum() + L5.variance.sum()).backward()  # loss touches BOTH outputs -> grad_fxn(dE, dV, call)
-L5u = L5.expected_value + L5.variance
-grad_a5 = compute_gradient(L5u.uop, L5u.uop.const_like(1.0), {A5._uop})[A5._uop]
-bt_map5 = {
-  A5._uop: A5,
-  B5._uop: B5,
-  A5.variance.uop: BayesTensor(A5.variance, A5.variance.const_like(0)),  # variance tensors are deterministic
-  B5.variance.uop: BayesTensor(B5.variance, B5.variance.const_like(0)),
-}
-gm5 = moments(grad_a5, bt_map5)
+  def test_fused_moments_gradient_variance(self):
+    (ma, va, mb, vb, _, _), _ = _abc_data()
+    A5 = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
+    B5 = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
+    L5 = fused_mul(A5, B5)
+    (L5.expected_value.sum() + L5.variance.sum()).backward()
+    L5u = L5.expected_value + L5.variance
+    grad_a5 = compute_gradient(L5u.uop, L5u.uop.const_like(1.0), {A5._uop})[A5._uop]
+    bt_map5 = {
+      A5._uop: A5,
+      B5._uop: B5,
+      A5.variance.uop: BayesTensor(A5.variance, A5.variance.const_like(0)),  # variance tensors are deterministic
+      B5.variance.uop: BayesTensor(B5.variance, B5.variance.const_like(0)),
+    }
+    gm5 = moments(grad_a5, bt_map5)
+    np.testing.assert_allclose(gm5.expected_value.numpy(), f32(mb + 2 * ma * vb), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(gm5.variance.numpy(), f32(vb + 4 * va * vb**2), atol=1e-4, rtol=1e-4)
 
-check("dE[L]/dma == mb + 2 ma vb", A5.expected_value.grad.numpy(), f32(mb + 2 * ma * vb))
-check("dE[L]/dva == mb^2 + vb", A5.variance.grad.numpy(), f32(mb**2 + vb))
-check("dE[L]/dmb == ma + 2 mb va", B5.expected_value.grad.numpy(), f32(ma + 2 * mb * va))
-check("dE[L]/dvb == ma^2 + va", B5.variance.grad.numpy(), f32(ma**2 + va))
-check("fused E == ma*mb", L5.expected_value.numpy(), f32(ma * mb))
-check("fused V == ma^2 vb + mb^2 va + va vb", L5.variance.numpy(), f32(ma**2 * vb + mb**2 * va + va * vb))
-check("E[grad_a] through fused bwd == mb + 2 ma vb", gm5.expected_value.numpy(), f32(mb + 2 * ma * vb))
-check("Var[grad_a] through fused bwd == vb + 4 va vb^2", gm5.variance.numpy(), f32(vb + 4 * va * vb**2))
+  def test_fused_moments_monte_carlo(self):
+    (ma, va, mb, vb, _, _), rng = _abc_data()
+    NS = 400_000
+    sa = rng.normal(ma, np.sqrt(va), (NS, len(ma)))
+    sb = rng.normal(mb, np.sqrt(vb), (NS, len(mb)))
+    # grad_a = b + 2 a vb
+    A5 = BayesTensor(Tensor(f32(ma)), Tensor(f32(va)))
+    B5 = BayesTensor(Tensor(f32(mb)), Tensor(f32(vb)))
+    L5 = fused_mul(A5, B5)
+    L5u = L5.expected_value + L5.variance
+    grad_a5 = compute_gradient(L5u.uop, L5u.uop.const_like(1.0), {A5._uop})[A5._uop]
+    bt_map5 = {
+      A5._uop: A5,
+      B5._uop: B5,
+      A5.variance.uop: BayesTensor(A5.variance, A5.variance.const_like(0)),
+      B5.variance.uop: BayesTensor(B5.variance, B5.variance.const_like(0)),
+    }
+    gm5 = moments(grad_a5, bt_map5)
+    np.testing.assert_allclose((sb + 2 * sa * vb).mean(0), gm5.expected_value.numpy(), atol=3e-3, rtol=3e-3)
+    np.testing.assert_allclose((sb + 2 * sa * vb).var(0), gm5.variance.numpy(), atol=1e-2, rtol=1e-2)
 
-NS = 400_000
-sa = rng.normal(ma, np.sqrt(va), (NS, N))
-sb = rng.normal(mb, np.sqrt(vb), (NS, N))
-mc_g = (sb + 2 * sa * vb).mean(0)
-mc_v = (sb + 2 * sa * vb).var(0)  # grad_a = b + 2 a vb
-check("MonteCarlo E[grad_a] == propagated", mc_g, gm5.expected_value.numpy(), tol=3e-3)
-check("MonteCarlo Var[grad_a] == propagated", mc_v, gm5.variance.numpy(), tol=1e-2)
-
-print("\nall checks passed")
+if __name__ == "__main__":
+  unittest.main()
